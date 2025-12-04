@@ -1,67 +1,1410 @@
-rules_version = '2';// Definição global para as coleções públicas no caminho padrão do Canvasservice cloud.firestore {match /databases/{database}/documents {// Captura o ID do aplicativo que está isolando os dados (appId)match /artifacts/{appId}/public/data {  // Função de apoio para extrair o papel (role) do usuário a partir do token de autenticação
-  // NOTA: Em um ambiente de produção, você deve usar `request.auth.token.role`.
-  // Como estamos simulando a autenticação via __initial_auth_token,
-  // esta regra pressupõe que o usuário está autenticado anonimamente,
-  // e por simplicidade, faremos o acesso público para leitura, mas
-  // o sistema implementa a lógica de roles no lado do cliente.
-  // 
-  // PARA PRODUÇÃO REAL:
-  // function isSignedIn() {
-  //   return request.auth != null;
-  // }
-  // function getRole() {
-  //   return request.auth.token.role; // Exige que o token contenha o campo 'role'
-  // }
-  
-  // =================================================================
-  // 1. REGRAS PARA FORNECEDORES (suppliers) - Módulo SRM
-  // =================================================================
-  match /suppliers/{supplierId} {
-    // Leitura: Permitida para todos que acessam o sistema (usuários autenticados)
-    allow read: if request.auth != null;
-    
-    // Criação/Escrita/Atualização: Apenas para usuários com o papel 'Compras'
-    // Simulação de regra de negócio: Apenas Compras pode cadastrar/editar fornecedores.
-    // NOTE: No ambiente atual (Canvas), request.auth.token.role NÃO está disponível.
-    // Se esta regra fosse aplicada diretamente, todos os usuários autenticados teriam 
-    // a mesma permissão. A lógica de role é forçada no lado do cliente (App.jsx).
-    // 
-    // Em produção, usaria: allow write: if getRole() == 'Compras';
-    allow write: if request.auth != null; // Permissão total para usuários logados na simulação
-  }
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 
-  // =================================================================
-  // 2. REGRAS PARA REQUISIÇÕES (requests) - Módulos PR, OC e Recebimento
-  // =================================================================
-  match /requests/{prId} {
-    // Leitura: Permitida para todos os usuários autenticados (visibilidade total do fluxo)
-    allow read: if request.auth != null;
+// Importações do Firebase SDK
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, onSnapshot, doc, addDoc, updateDoc, arrayUnion, serverTimestamp } from 'firebase/firestore';
 
-    // Criação: Permitida para todos os usuários autenticados (simulando Solicitante)
-    allow create: if request.auth != null; 
-    
-    // Atualização (write/update): Requer regras mais específicas baseadas no status
-    allow update: if request.auth != null && (
+// --- Variáveis Globais do Ambiente Canvas (OBRIGATÓRIO) ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-eprocurement-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-      // 2.1. Permissão para Solicitante (para Rascunho e Rejeitada)
-      // Em produção: request.auth.token.role == 'Solicitante' && resource.data.createdBy == request.auth.uid &&
-      (resource.data.status == 'Rascunho' || resource.data.status == 'Rejeitada') 
-      
-      // 2.2. Permissão para Aprovação N1
-      // Em produção: || (request.auth.token.role == 'Aprovador N1' && resource.data.status == 'Aprovacao_N1_Pendente')
-      || (resource.data.status == 'Aprovacao_N1_Pendente')
+// --- Constantes Globais da Aplicação ---
+const costCenters = ['CC-Financeiro', 'CC-TI', 'CC-Operações', 'CC-Vendas', 'CC-RH'];
+const units = ['un', 'kg', 'm', 'serv', 'pacote', 'caixa', 'lt'];
+const PR_STATUSES = {
+    DRAFT: 'Rascunho',
+    SUBMITTED: 'Submetida',
+    PENDING_N1: 'Aprovacao_N1_Pendente',
+    PENDING_N2: 'Aprovacao_N2_Pendente',
+    APPROVED_FOR_SOURCING: 'Aprovada_para_Cotacao',
+    REJECTED: 'Rejeitada',
+    OC_ISSUED: 'OC_Emitida',
+    DELIVERED_PARCIAL: 'Entregue_Parcial',
+    DELIVERED_TOTAL: 'Entregue_Total',
+};
+// NOVAS CONSTANTES: Mapas de Papéis Disponíveis
+const AVAILABLE_ROLES = {
+    SOLICITANTE: 'Solicitante',
+    APROVADOR_N1: 'Aprovador N1',
+    APROVADOR_N2: 'Aprovador N2',
+    COMPRAS: 'Compras',
+};
 
-      // 2.3. Permissão para Aprovação N2
-      // Em produção: || (request.auth.token.role == 'Aprovador N2' && resource.data.status == 'Aprovacao_N2_Pendente')
-      || (resource.data.status == 'Aprovacao_N2_Pendente')
+// --- Funções Auxiliares de UI e Dados ---
+const timestampToDateInput = (timestamp) => {
+  if (!timestamp || !timestamp.toDate) return '';
+  const date = timestamp.toDate();
+  return date.toISOString().split('T')[0];
+};
 
-      // 2.4. Permissão para Compras (Gerar OC, Registrar Recebimento)
-      // Em produção: || request.auth.token.role == 'Compras'
-      || (resource.data.status == 'Aprovada_para_Cotacao' || resource.data.status == 'OC_Emitida' || resource.data.status == 'Entregue_Parcial')
+const formatDate = (timestamp) => {
+    if (!timestamp || !timestamp.toDate) return 'N/A';
+    return timestamp.toDate().toLocaleString('pt-BR');
+};
+
+const getStatusColor = (status) => {
+    switch (status) {
+        case PR_STATUSES.DRAFT: return 'bg-gray-100 text-gray-700';
+        case PR_STATUSES.SUBMITTED:
+        case PR_STATUSES.PENDING_N1:
+        case PR_STATUSES.PENDING_N2: return 'bg-yellow-100 text-yellow-800';
+        case PR_STATUSES.APPROVED_FOR_SOURCING: return 'bg-cyan-100 text-cyan-800';
+        case PR_STATUSES.OC_ISSUED: return 'bg-indigo-100 text-indigo-800';
+        case PR_STATUSES.DELIVERED_PARCIAL: return 'bg-blue-100 text-blue-800';
+        case PR_STATUSES.DELIVERED_TOTAL: return 'bg-green-100 text-green-800';
+        case PR_STATUSES.REJECTED: return 'bg-red-100 text-red-800';
+        default: return 'bg-gray-200 text-gray-600';
+    }
+};
+
+// FUNÇÃO UTILITÁRIA PARA VALIDAR CERTIDÃO DO FORNECEDOR (Movida para o escopo global)
+const checkValidity = (dateStr) => {
+    if (!dateStr) return { status: 'Não Informado', color: 'bg-gray-500 text-white' };
+    const today = new Date();
+    const validDate = new Date(dateStr);
+    validDate.setDate(validDate.getDate() + 1); // Ajuste para comparação correta no limite do dia
+
+    if (validDate < today) {
+        return { status: 'Vencida', color: 'bg-red-600 text-white' };
+    }
+    return { status: 'Válida', color: 'bg-green-500 text-white' };
+};
+
+// --- Componente de Modal Simples (Substitui prompt/alert) ---
+const PromptModal = ({ title, fields, onSubmit, onCancel, submitLabel = 'Confirmar' }) => {
+    const [inputValues, setInputValues] = useState(fields.reduce((acc, field) => ({ ...acc, [field.name]: field.initialValue || '' }), {}));
+    const [error, setError] = useState('');
+
+    const handleInputChange = (e) => {
+        const { name, value, type } = e.target;
+        setInputValues(prev => ({ ...prev, [name]: type === 'number' ? parseFloat(value) : value }));
+        setError('');
+    };
+
+    const handleSubmit = (e) => {
+        e.preventDefault();
+        const missingFields = fields.filter(f => f.required && (!inputValues[f.name] && inputValues[f.name] !== 0));
+        
+        if (missingFields.length > 0) {
+            setError(`O campo "${missingFields[0].label}" é obrigatório.`);
+            return;
+        }
+        
+        // Validação adicional para campos numéricos (min/max)
+        for (const field of fields) {
+            if (field.type === 'number') {
+                const numValue = parseFloat(inputValues[field.name]);
+                if (field.min !== undefined && numValue < field.min) {
+                    setError(`O valor para "${field.label}" deve ser no mínimo ${field.min}.`);
+                    return;
+                }
+                if (field.max !== undefined && numValue > field.max) {
+                    setError(`O valor para "${field.label}" deve ser no máximo ${field.max}.`);
+                    return;
+                }
+            }
+        }
+        
+        onSubmit(inputValues);
+    };
+
+    return (
+        <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-md">
+                <div className="p-6 border-b">
+                    <h4 className="text-xl font-bold text-gray-800">{title}</h4>
+                </div>
+                <form onSubmit={handleSubmit} className="p-6 space-y-4">
+                    {error && <div className="p-3 bg-red-100 text-red-700 rounded-lg text-sm">{error}</div>}
+                    {fields.map(field => (
+                        <div key={field.name}>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">{field.label} {field.required && <span className="text-red-500">*</span>}</label>
+                            {field.type === 'textarea' ? (
+                                <textarea name={field.name} value={inputValues[field.name]} onChange={handleInputChange} rows="3" className="w-full p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500"></textarea>
+                            ) : (
+                                <input name={field.name} type={field.type} min={field.min} step={field.step} value={inputValues[field.name]} onChange={handleInputChange} className="w-full p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+                            )}
+                        </div>
+                    ))}
+                    <div className="flex justify-end space-x-3 pt-4">
+                        <button type="button" onClick={onCancel} className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-100 transition duration-150">
+                            Cancelar
+                        </button>
+                        <button type="submit" className="px-4 py-2 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition duration-150">
+                            {submitLabel}
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
     );
-    
-    // Exclusão: Ninguém pode excluir requisições no fluxo
-    allow delete: if false; 
+};
+
+// --- Novo Componente de Login (Seleção de Papel) ---
+const LoginScreen = ({ onLogin, firebaseUserId }) => {
+    const [selectedRole, setSelectedRole] = useState(AVAILABLE_ROLES.COMPRAS); // Padrão
+    // MODIFICADO: Usando campos de e-mail e senha simulados
+    const [email, setEmail] = useState(`user-${firebaseUserId?.substring(0, 8)}@evereste.com`); // Email simulado
+    const [password, setPassword] = useState('123456'); // Senha simulada
+
+    const handleLogin = (e) => {
+        e.preventDefault();
+        // Passa o email (para o nome de exibição) e o papel
+        onLogin(selectedRole, email); 
+    };
+
+    return (
+        <div className="flex items-center justify-center min-h-screen bg-gray-100 p-4">
+            <div className="w-full max-w-md bg-white p-8 rounded-xl shadow-xl border border-gray-200">
+                <h1 className="text-3xl font-bold text-center text-blue-800 mb-6">
+                    Sistema de Compras Evereste
+                </h1>
+                <p className="text-center text-sm text-gray-500 mb-8">
+                    Autenticado via Firebase (UID: {firebaseUserId ? firebaseUserId.substring(0, 12) : '...'}).
+                    Simule o login e selecione seu papel.
+                </p>
+
+                <form onSubmit={handleLogin} className="space-y-6">
+                    {/* NOVO CAMPO: E-mail */}
+                    <div>
+                        <label htmlFor="email" className="block text-sm font-medium text-gray-700">E-mail</label>
+                        <input
+                            id="email"
+                            type="email"
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            required
+                            className="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500"
+                        />
+                    </div>
+                    
+                    {/* NOVO CAMPO: Senha */}
+                    <div>
+                        <label htmlFor="password" className="block text-sm font-medium text-gray-700">Senha</label>
+                        <input
+                            id="password"
+                            type="password"
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            required
+                            className="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500"
+                        />
+                    </div>
+
+                    {/* CAMPO EXISTENTE: Seleção de Papel */}
+                    <div>
+                        <label htmlFor="role" className="block text-sm font-medium text-gray-700">Papel na Aplicação (Role)</label>
+                        <select
+                            id="role"
+                            value={selectedRole}
+                            onChange={(e) => setSelectedRole(e.target.value)}
+                            className="mt-1 w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 appearance-none bg-white"
+                        >
+                            {Object.values(AVAILABLE_ROLES).map(role => (
+                                <option key={role} value={role}>{role}</option>
+                            ))}
+                        </select>
+                    </div>
+
+                    <button
+                        type="submit"
+                        className="w-full px-4 py-3 bg-blue-600 text-white font-semibold rounded-lg hover:bg-blue-700 transition duration-150 shadow-md"
+                    >
+                        Entrar no Sistema
+                    </button>
+                </form>
+            </div>
+        </div>
+    );
+};
+
+// --- Componente Principal da Aplicação ---
+const App = () => {
+  // Estados para o Firebase e autenticação
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [currentUserName, setCurrentUserName] = useState(null); // Agora inicializa como null
+  const [selectedRole, setSelectedRole] = useState(null);       // NOVO ESTADO: Papel selecionado na aplicação
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // O userRole para lógica de negócios agora é 'selectedRole'
+  const appUserRole = selectedRole; 
+
+  // Estados dos Dados
+  const [activeTab, setActiveTab] = useState('pr');
+  const [requisitions, setRequisitions] = useState([]); // Requisições (PR)
+  const [suppliers, setSuppliers] = useState([]);       // Fornecedores (SRM)
+  const [orders, setOrders] = useState([]);             // Pedidos (OC) - Usaremos a coleção 'prs' com status OC_Emitida
+
+  // Estado para Mensagens
+  const [globalMessage, setGlobalMessage] = useState({ text: '', type: '' }); // type: 'success' | 'error'
+
+  const showGlobalMessage = useCallback((text, type = 'success', duration = 5000) => {
+    setGlobalMessage({ text, type });
+    setTimeout(() => setGlobalMessage({ text: '', type: '' }), duration);
+  }, []);
+
+  // 1. Inicialização do Firebase e Autenticação
+  useEffect(() => {
+    if (!firebaseConfig) {
+      console.error("Configuração do Firebase não encontrada.");
+      return;
+    }
+
+    try {
+      const app = initializeApp(firebaseConfig);
+      const newAuth = getAuth(app);
+      const newDb = getFirestore(app);
+
+      setAuth(newAuth);
+      setDb(newDb);
+
+      const unsubscribe = onAuthStateChanged(newAuth, (user) => {
+        if (user) {
+          setUserId(user.uid);
+          // O nome inicial é apenas o UID; o nome completo e o papel serão definidos no LoginScreen
+          setCurrentUserName(`UID-${user.uid.substring(0, 8)}`); 
+          setIsAuthReady(true);
+        } else {
+          if (!isAuthReady) {
+            (async () => {
+              try {
+                if (initialAuthToken) {
+                  await signInWithCustomToken(newAuth, initialAuthToken);
+                } else {
+                  await signInAnonymously(newAuth);
+                }
+              } catch (error) {
+                console.error("Erro ao fazer login inicial:", error);
+                setIsAuthReady(true);
+              }
+            })();
+          }
+        }
+      });
+      return () => unsubscribe();
+
+    } catch (error) {
+      console.error("Erro na inicialização do Firebase:", error);
+      setIsAuthReady(true);
+    }
+  }, [isAuthReady]);
+
+  // Função de Login/Seleção de Papel
+  const handleLogin = (role, email) => {
+    setSelectedRole(role);
+    // Usa o email para o nome de exibição + o papel
+    setCurrentUserName(`${email.split('@')[0]} (${role})`); 
+    showGlobalMessage(`Bem-vindo(a), ${email.split('@')[0]}! Papel: ${role}.`, 'success', 4000);
+  };
+
+  // Função para obter referência de coleção (público)
+  const getCollectionRef = useCallback((collectionName) => {
+    if (!db) return null;
+    // Caminho público: /artifacts/{appId}/public/data/{collectionName}
+    return collection(db, 'artifacts', appId, 'public', 'data', collectionName);
+  }, [db]);
+
+  // 2. Carregamento de Dados (Fornecedores e Requisições)
+  useEffect(() => {
+    // Só carrega os dados se a autenticação Firebase estiver pronta E o papel da aplicação tiver sido selecionado
+    if (!isAuthReady || !userId || !db || !appUserRole) return;
+
+    // Listener para Fornecedores
+    const suppliersRef = getCollectionRef('suppliers');
+    const unsubscribeSuppliers = onSnapshot(suppliersRef, (snapshot) => {
+      const suppliersList = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        // Normaliza a data de validade para input[type=date]
+        validadeCertidao: doc.data().validadeCertidao ? timestampToDateInput(doc.data().validadeCertidao) : '',
+      }));
+      setSuppliers(suppliersList);
+    }, (error) => console.error("Erro ao carregar fornecedores:", error));
+
+    // Listener para Requisições/Pedidos (OC)
+    const requestsRef = getCollectionRef('requests');
+    const unsubscribeRequests = onSnapshot(requestsRef, (snapshot) => {
+      const requestsList = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        // Garante que deliveries e auditTrail sejam arrays
+        auditTrail: doc.data().auditTrail || [],
+        deliveries: doc.data().deliveries || [],
+        quantitiesReceived: doc.data().quantitiesReceived || 0,
+      }));
+      setRequisitions(requestsList.sort((a, b) => b.createdAt?.toDate() - a.createdAt?.toDate())); // Ordena por criação
+      setOrders(requestsList.filter(r => r.status === PR_STATUSES.OC_ISSUED));
+    }, (error) => console.error("Erro ao carregar requisições:", error));
+
+    return () => {
+      unsubscribeSuppliers();
+      unsubscribeRequests();
+    };
+  }, [isAuthReady, userId, db, getCollectionRef, appUserRole]); // Adicionado appUserRole como dependência
+
+  if (!isAuthReady || !userId) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50">
+        <div className="text-xl font-medium text-blue-600 animate-pulse">Carregando Sistema de Compras Evereste...</div>
+      </div>
+    );
   }
-}
-}}
+  
+  // Se a autenticação Firebase estiver OK, mas o papel da aplicação não estiver selecionado, mostra o LoginScreen
+  if (!appUserRole) {
+      return <LoginScreen onLogin={handleLogin} firebaseUserId={userId} />;
+  }
+
+  // Fornecedores Ativos para Select
+  const activeSuppliers = suppliers.filter(s => s.status === 'Ativo');
+
+  // --- Funções de Ação Comuns ---
+
+  // CORREÇÃO: Usar new Date() em vez de serverTimestamp() para timestamps dentro de arrays (auditTrail)
+  const createAuditEntry = (action, note, role = appUserRole, level) => ({
+      action,
+      role: role.split(' ')[0], // Ex: 'Aprovador N1' -> 'Aprovador'
+      level: level || role.split(' ').pop(), // Ex: 'Aprovador N1' -> 'N1'
+      actor: currentUserName,
+      timestamp: new Date(), // CORRIGIDO: Usando new Date() para evitar erro do Firestore em arrays
+      note,
+  });
+
+  // Função para criar um novo item em qualquer coleção
+  const createItem = async (collectionName, data, auditNote = 'Criação de documento') => {
+    try {
+      const colRef = getCollectionRef(collectionName);
+      if (colRef) {
+        // serverTimestamp() é OK no campo 'createdAt' (root level)
+        const audit = createAuditEntry('Criação', auditNote, appUserRole, 'Sistema');
+        await addDoc(colRef, { ...data, createdAt: serverTimestamp(), auditTrail: [audit] });
+        return { success: true };
+      }
+      return { success: false, error: 'Coleção não encontrada.' };
+    } catch (e) {
+      console.error("Erro ao adicionar documento: ", e);
+      return { success: false, error: e.message };
+    }
+  };
+
+  // Função para atualizar um item
+  const updateItem = async (collectionName, id, data, auditEntry = null) => {
+    try {
+      const docRef = doc(getCollectionRef(collectionName), id);
+      const updateData = { ...data };
+
+      if (auditEntry) {
+          updateData.auditTrail = arrayUnion(auditEntry);
+      }
+
+      await updateDoc(docRef, updateData);
+      return { success: true };
+    } catch (e) {
+      console.error("Erro ao atualizar documento: ", e);
+      return { success: false, error: e.message };
+    }
+  };
+
+  // Função para exportar PRs para CSV
+  const exportPRsToCSV = () => {
+    const headers = ["ID", "Produto/Serviço", "Qtde Solicitada", "Qtde Recebida", "Status", "Centro de Custo", "Fornecedor Sugerido", "Data Necessidade"];
+    
+    const csvContent = requisitions.map(pr => [
+      pr.id.substring(0, 8),
+      `"${pr.produtoServico}"`,
+      pr.quantidade,
+      pr.quantitiesReceived,
+      pr.status,
+      pr.centroCusto,
+      pr.sugestaoFornecedor,
+      pr.dataNecessidade,
+    ].join(',')).join('\n');
+
+    const fullCSV = headers.join(',') + '\n' + csvContent;
+    const blob = new Blob([fullCSV], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `requisicoes_evereste_${new Date().toISOString().split('T')[0]}.csv`);
+    link.click();
+    showGlobalMessage('PRs exportadas para CSV com sucesso!');
+  };
+
+  // --- Módulos da Aplicação (Componentes Internos) ---
+
+  // Componente Requisitor List (Para PRModule)
+  const RequisitionList = ({ requisitions, title }) => {
+    const [showAudit, setShowAudit] = useState(null); // ID da PR para exibir trilha
+    const [promptModal, setPromptModal] = useState(null); // Estado para o PromptModal
+
+    // Checa se o usuário logado pode executar a ação
+    const canApprove = (pr) => {
+        if (appUserRole === AVAILABLE_ROLES.APROVADOR_N1 && pr.status === PR_STATUSES.PENDING_N1) return true;
+        if (appUserRole === AVAILABLE_ROLES.APROVADOR_N2 && pr.status === PR_STATUSES.PENDING_N2) return true;
+        return false;
+    };
+
+    // Checa se a PR pode ser editada (Rascunho ou Rejeitada)
+    const canEdit = (pr) => {
+        return (pr.status === PR_STATUSES.DRAFT || pr.status === PR_STATUSES.REJECTED) && appUserRole === AVAILABLE_ROLES.SOLICITANTE;
+    };
+
+    const handleAction = (pr, actionType) => {
+        if (actionType === 'reject') {
+            setPromptModal({
+                title: 'Motivo da Reprovação',
+                fields: [{ name: 'reason', label: 'Motivo', type: 'textarea', required: true }],
+                onSubmit: (data) => {
+                    executeApprovalAction(pr, actionType, data.reason);
+                    setPromptModal(null);
+                },
+                onCancel: () => setPromptModal(null),
+                submitLabel: 'Reprovar'
+            });
+        } else if (actionType === 'approve') {
+            executeApprovalAction(pr, actionType);
+        }
+    };
+
+    const executeApprovalAction = async (pr, actionType, reason = '') => {
+        let newStatus;
+        let auditNote = '';
+        let level = appUserRole.split(' ').pop(); // N1 ou N2
+        let rejectionReason = null;
+        let nextRole = '';
+
+        if (actionType === 'approve') {
+            if (pr.status === PR_STATUSES.PENDING_N1) {
+                newStatus = PR_STATUSES.PENDING_N2;
+                auditNote = `Aprovado pelo N1. Encaminhado para aprovação do N2.`;
+                nextRole = 'N2';
+            } else if (pr.status === PR_STATUSES.PENDING_N2) {
+                newStatus = PR_STATUSES.APPROVED_FOR_SOURCING;
+                auditNote = `Aprovado pelo N2. Encaminhado para Sourcing.`;
+                nextRole = 'Sourcing';
+            } else {
+                return;
+            }
+        } else if (actionType === 'reject') {
+            newStatus = PR_STATUSES.REJECTED;
+            auditNote = `Reprovado pelo ${level}: ${reason}`;
+            rejectionReason = reason;
+        }
+
+        const auditEntry = createAuditEntry(actionType === 'approve' ? 'Aprovação' : 'Reprovação', auditNote, appUserRole, level);
+
+        const result = await updateItem('requests', pr.id, {
+            status: newStatus,
+            rejectionReason: rejectionReason,
+        }, auditEntry);
+
+        if (result.success) {
+            showGlobalMessage(`PR ${pr.id.substring(0, 8)} ${actionType === 'approve' ? 'aprovada' : 'reprovada'} com sucesso! Próximo passo: ${nextRole || newStatus}.`);
+        } else {
+            showGlobalMessage(`Erro na ação: ${result.error}`, 'error');
+        }
+    };
+
+    return (
+        <>
+            {/* MODIFICAÇÃO: shadow-md -> shadow-sm */}
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-semibold text-gray-700">{title} ({requisitions.length})</h3>
+                    <button onClick={exportPRsToCSV} className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-300 transition duration-150">
+                        Exportar CSV
+                    </button>
+                </div>
+                <div className="overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200">
+                        <thead>
+                            <tr className="text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
+                                <th className="px-6 py-3 text-left">ID</th>
+                                <th className="px-6 py-3 text-left">Item</th>
+                                <th className="px-6 py-3 text-center">Qtde Solicitada</th>
+                                <th className="px-6 py-3 text-center">Qtde Recebida</th>
+                                <th className="px-6 py-3 text-left">Centro de Custo</th>
+                                <th className="px-6 py-3 text-center">Status</th>
+                                <th className="px-6 py-3 text-right">Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody className="bg-white divide-y divide-gray-200">
+                            {requisitions.map(pr => (
+                                <tr key={pr.id} className="hover:bg-gray-50">
+                                    <td className="px-6 py-4 whitespace-nowrap text-xs font-mono text-gray-900">{pr.id.substring(0, 8)}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{pr.produtoServico}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 text-center">{pr.quantidade} {pr.unidade}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 text-center">{pr.quantitiesReceived} / {pr.quantidade}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{pr.centroCusto}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-center">
+                                        <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${getStatusColor(pr.status)}`}>
+                                            {pr.status.replace(/_/g, ' ')}
+                                        </span>
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
+                                        <button onClick={() => setShowAudit(pr.id)} className="text-indigo-600 hover:text-indigo-900 transition duration-150">Trilha</button>
+                                        <button onClick={() => handleEditPR(pr.id)} className={`transition duration-150 ${canEdit(pr) ? 'text-blue-600 hover:text-blue-900' : 'text-gray-400 cursor-default'}`} disabled={!canEdit(pr)}>Editar</button>
+                                        {canApprove(pr) && (
+                                            <>
+                                                <button onClick={() => handleAction(pr, 'approve')} className="text-green-600 hover:text-green-900 transition duration-150 ml-2">Aprovar</button>
+                                                <button onClick={() => handleAction(pr, 'reject')} className="text-red-600 hover:text-red-900 transition duration-150 ml-2">Reprovar</button>
+                                            </>
+                                        )}
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+                {requisitions.length === 0 && <p className="text-center text-gray-500 italic mt-4">Nenhuma requisição encontrada.</p>}
+
+                {/* Modal Trilha de Auditoria */}
+                {showAudit && (
+                    <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center p-4 z-50">
+                        <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl">
+                            <div className="p-6 border-b flex justify-between items-center">
+                                <h4 className="text-lg font-bold text-gray-800">Trilha de Auditoria - PR {showAudit.substring(0, 8)}</h4>
+                                <button onClick={() => setShowAudit(null)} className="text-gray-500 hover:text-gray-800">
+                                    &times;
+                                </button>
+                            </div>
+                            <div className="p-6 max-h-96 overflow-y-auto space-y-4">
+                                {requisitions.find(r => r.id === showAudit)?.auditTrail.slice().reverse().map((entry, index) => (
+                                    <div key={index} className="border-l-4 border-blue-500 pl-4 py-2 bg-blue-50 rounded-r-lg">
+                                        <p className="text-sm font-semibold text-gray-800">{entry.action.replace(/_/g, ' ')} ({entry.level}) por {entry.actor}</p>
+                                        <p className="text-xs text-gray-500">{formatDate(entry.timestamp)}</p>
+                                        <p className="text-sm italic text-gray-600 mt-1">{entry.note}</p>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </div>
+            {/* Renderiza o Prompt Modal se estiver ativo */}
+            {promptModal && <PromptModal {...promptModal} />}
+        </>
+    );
+  };
+
+  // --- Módulo: Requisições (PR) - Lógica do Formulário ---
+  const PRForm = ({ prToEdit }) => {
+    const isEditing = !!prToEdit;
+    const [formData, setFormData] = useState(isEditing ? {
+        produtoServico: prToEdit.produtoServico,
+        quantidade: prToEdit.quantidade,
+        unidade: prToEdit.unidade,
+        dataNecessidade: prToEdit.dataNecessidade,
+        centroCusto: prToEdit.centroCusto,
+        justificativa: prToEdit.justificativa,
+        sugestaoFornecedor: prToEdit.sugestaoFornecedor,
+        nomeArquivo: prToEdit.nomeArquivo,
+    } : {
+      produtoServico: '', quantidade: 1, unidade: units[0], dataNecessidade: '', centroCusto: costCenters[0],
+      justificativa: '', sugestaoFornecedor: activeSuppliers.length > 0 ? activeSuppliers[0].razaoSocial : '',
+      nomeArquivo: ''
+    });
+
+    const handleInputChange = (e) => {
+      const { name, value, type } = e.target;
+      setFormData(prev => ({ ...prev, [name]: type === 'number' ? parseFloat(value) : value }));
+    };
+
+    const handleFileChange = (e) => {
+        const file = e.target.files[0];
+        setFormData(prev => ({ ...prev, nomeArquivo: file ? file.name : '' }));
+    };
+
+    const handleSubmit = async (e, submitType) => {
+      e.preventDefault();
+
+      if (formData.quantidade <= 0) {
+          showGlobalMessage('A quantidade deve ser maior que zero.', 'error');
+          return;
+      }
+
+      const status = submitType === 'submit' ? PR_STATUSES.PENDING_N1 : PR_STATUSES.DRAFT;
+      const action = submitType === 'submit' ? 'Submissão' : (isEditing ? 'Edição' : 'Criação Rascunho');
+      const auditNote = isEditing ? `PR editada e salva como ${status}.` : `Nova PR salva como ${status}.`;
+
+      const dataToSave = {
+        ...formData,
+        status,
+        quantitiesReceived: isEditing ? prToEdit.quantitiesReceived : 0, // Mantém ou inicia 0
+        quantidade: formData.quantidade,
+      };
+
+      let result;
+      if (isEditing) {
+          const auditEntry = createAuditEntry(action, auditNote, appUserRole, 'Sistema');
+          result = await updateItem('requests', prToEdit.id, dataToSave, auditEntry);
+      } else {
+          result = await createItem('requests', dataToSave, auditNote);
+      }
+
+      if (result.success) {
+        showGlobalMessage(`Requisição ${isEditing ? 'atualizada' : 'criada'} com sucesso! Status: ${status}.`);
+        if (!isEditing || submitType === 'submit') {
+            setActiveTab('pr'); // Volta para a lista
+        }
+        if (!isEditing) {
+             setFormData({ // Reseta o formulário
+                produtoServico: '', quantidade: 1, unidade: units[0], dataNecessidade: '', centroCusto: costCenters[0],
+                justificativa: '', sugestaoFornecedor: activeSuppliers.length > 0 ? activeSuppliers[0].razaoSocial : '',
+                nomeArquivo: ''
+            });
+        }
+      } else {
+        showGlobalMessage(`Erro ao salvar requisição: ${result.error}`, 'error');
+      }
+    };
+
+    return (
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+            <h3 className="text-xl font-semibold mb-4 text-gray-700">{isEditing ? `Editar PR ${prToEdit.id.substring(0, 8)}` : 'Criar Nova Requisição'}</h3>
+            <form className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <input name="produtoServico" type="text" placeholder="Produto/Serviço" value={formData.produtoServico} onChange={handleInputChange} required className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+
+                <div className="flex space-x-2">
+                    <input name="quantidade" type="number" min="1" step="any" placeholder="Quantidade" value={formData.quantidade} onChange={handleInputChange} required className="w-2/3 p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+                    <select name="unidade" value={formData.unidade} onChange={handleInputChange} required className="w-1/3 p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500 appearance-none">
+                        {units.map(u => <option key={u} value={u}>{u}</option>)}
+                    </select>
+                </div>
+
+                <div className="flex items-center">
+                    <span className="w-1/2 text-sm text-gray-600 mr-2">Data Necessidade:</span>
+                    <input name="dataNecessidade" type="date" value={formData.dataNecessidade} onChange={handleInputChange} required className="w-1/2 p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+                </div>
+
+                <select name="centroCusto" value={formData.centroCusto} onChange={handleInputChange} required className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500 appearance-none">
+                    <option value="">Selecione o Centro de Custo</option>
+                    {costCenters.map(cc => <option key={cc} value={cc}>{cc}</option>)}
+                </select>
+
+                <select name="sugestaoFornecedor" value={formData.sugestaoFornecedor} onChange={handleInputChange} className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500 appearance-none" disabled={activeSuppliers.length === 0}>
+                    <option value="">Sugestão de Fornecedor (Ativo)</option>
+                    {activeSuppliers.map(s => <option key={s.id} value={s.razaoSocial}>{s.razaoSocial}</option>)}
+                </select>
+
+                <div className="flex items-center p-3 border border-dashed border-gray-300 rounded-lg">
+                    <label className="text-sm text-gray-500 cursor-pointer hover:text-blue-600">
+                        {formData.nomeArquivo || 'Upload de Arquivo (Opcional)'}
+                        <input type="file" onChange={handleFileChange} className="hidden" />
+                    </label>
+                </div>
+
+                <textarea name="justificativa" placeholder="Justificativa da Compra (Obrigatório)" value={formData.justificativa} onChange={handleInputChange} required className="md:col-span-2 lg:col-span-3 p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" rows="3"></textarea>
+
+                <div className="md:col-span-2 lg:col-span-3 flex justify-end space-x-4 mt-4">
+                    <button type="button" onClick={(e) => handleSubmit(e, 'draft')} className="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-100 transition duration-150">
+                        Salvar Rascunho
+                    </button>
+                    <button type="button" onClick={(e) => handleSubmit(e, 'submit')} className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition duration-150">
+                        {isEditing ? 'Atualizar e Submeter' : 'Enviar para Aprovação'}
+                    </button>
+                </div>
+            </form>
+        </div>
+    );
+  };
+
+  const PRModule = () => {
+    // Filtrar PRs para a lista principal (exclui rascunhos puros)
+    const displayRequisitions = requisitions.filter(r => r.status !== PR_STATUSES.DRAFT);
+    
+    // Simula a edição
+    const [selectedPR, setSelectedPR] = useState(null);
+
+    // Função para selecionar PR e mudar para o formulário
+    const handleEditPR = (prId) => {
+        const pr = requisitions.find(r => r.id === prId);
+        if (pr && (pr.status === PR_STATUSES.DRAFT || pr.status === PR_STATUSES.REJECTED)) {
+            setSelectedPR(pr);
+            setActiveTab('pr_edit');
+        }
+    };
+
+    if (activeTab === 'pr_edit') {
+        // Encontra a PR real ou exibe o formulário de criação
+        const currentPr = selectedPR || null;
+        return (
+            <div className="p-6 space-y-8 bg-gray-50 min-h-[calc(100vh-120px)]">
+                <h2 className="text-3xl font-bold text-gray-800 border-b pb-2">
+                    {currentPr ? `Editar Requisição ${currentPr.id.substring(0, 8)}` : 'Nova Requisição de Compra'}
+                </h2>
+                <PRForm prToEdit={currentPr} />
+            </div>
+        );
+    }
+
+    return (
+      <div className="p-6 space-y-8 bg-gray-50 min-h-[calc(100vh-120px)]">
+        <h2 className="text-3xl font-bold text-gray-800 border-b pb-2">Módulo Requisições de Compra (PR)</h2>
+
+        <button onClick={() => setActiveTab('pr_edit')} className="px-6 py-3 bg-green-600 text-white rounded-lg font-semibold hover:bg-green-700 transition duration-150 shadow-sm">
+            + Criar Nova Requisição
+        </button>
+
+        <RequisitionList requisitions={displayRequisitions} title="Lista de Requisições Submetidas e em Fluxo" />
+      </div>
+    );
+  };
+
+  // --- Módulo: Cadastro de Fornecedores (SRM) ---
+  const SRMModule = () => {
+    const [formData, setFormData] = useState({
+      cnpj: '', razaoSocial: '', contato: { name: '', email: '', phone: '' }, categoria: '', validadeCertidao: '', status: 'Ativo', performanceScore: 50
+    });
+    const [isEditing, setIsEditing] = useState(false);
+    const [editId, setEditId] = useState(null);
+
+    const categories = ['Material Direto', 'Material Indireto', 'Serviço de TI', 'Consultoria'];
+
+    const handleInputChange = (e) => {
+      const { name, value, type } = e.target;
+
+      if (name in formData.contato) {
+        setFormData(prev => ({ ...prev, contato: { ...prev.contato, [name]: value } }));
+      } else {
+        setFormData(prev => ({ ...prev, [name]: type === 'number' ? parseInt(value, 10) : value }));
+      }
+    };
+
+    const handleEdit = (supplier) => {
+      setFormData({
+          ...supplier,
+          contato: supplier.contato || { name: '', email: '', phone: '' }
+      });
+      setIsEditing(true);
+      setEditId(supplier.id);
+      showGlobalMessage('', '');
+    };
+
+    const handleCancel = () => {
+      setFormData({
+        cnpj: '', razaoSocial: '', contato: { name: '', email: '', phone: '' }, categoria: '', validadeCertidao: '', status: 'Ativo', performanceScore: 50
+      });
+      setIsEditing(false);
+      setEditId(null);
+      showGlobalMessage('', '');
+    };
+
+    const handleSubmit = async (e) => {
+      e.preventDefault();
+      showGlobalMessage('Processando...', 'loading');
+
+      // Cria um objeto de data a partir da string de input para o Firestore
+      const certDate = formData.validadeCertidao ? new Date(formData.validadeCertidao) : null;
+      const dataToSave = {
+        ...formData,
+        performanceScore: parseInt(formData.performanceScore, 10),
+        validadeCertidao: certDate || null,
+      };
+
+      let result;
+      let auditNote = `Fornecedor ${formData.razaoSocial} ${isEditing ? 'atualizado' : 'cadastrado'}.`;
+
+      if (isEditing) {
+        const auditEntry = createAuditEntry('Atualização SRM', auditNote, appUserRole, AVAILABLE_ROLES.COMPRAS);
+        result = await updateItem('suppliers', editId, dataToSave, auditEntry);
+      } else {
+        result = await createItem('suppliers', dataToSave, auditNote);
+      }
+
+      if (result.success) {
+        showGlobalMessage(`Fornecedor ${isEditing ? 'atualizado' : 'cadastrado'} com sucesso!`);
+        handleCancel();
+      } else {
+        showGlobalMessage(`Erro: ${result.error}`, 'error');
+      }
+    };
+
+    return (
+      <div className="p-6 space-y-8 bg-gray-50 min-h-[calc(100vh-120px)]">
+        <h2 className="text-3xl font-bold text-gray-800 border-b pb-2">Cadastro de Fornecedores (SRM)</h2>
+
+        {/* Formulário de Cadastro/Edição */}
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+          <h3 className="text-xl font-semibold mb-4 text-gray-700">{isEditing ? 'Editar Fornecedor' : 'Novo Fornecedor'}</h3>
+          <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <input name="cnpj" type="text" placeholder="CNPJ" value={formData.cnpj} onChange={handleInputChange} required className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+            <input name="razaoSocial" type="text" placeholder="Razão Social" value={formData.razaoSocial} onChange={handleInputChange} required className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+            <input name="name" type="text" placeholder="Nome Contato" value={formData.contato.name} onChange={handleInputChange} className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+
+            <input name="email" type="email" placeholder="E-mail Contato" value={formData.contato.email} onChange={handleInputChange} className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+            <input name="phone" type="tel" placeholder="Telefone Contato" value={formData.contato.phone} onChange={handleInputChange} className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+
+            <select name="categoria" value={formData.categoria} onChange={handleInputChange} required className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500 appearance-none">
+              <option value="">Selecione a Categoria</option>
+              {categories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+            </select>
+
+            <div className="flex items-center space-x-4">
+                <span className="w-1/2 text-sm text-gray-600">Validade Certidão:</span>
+                <input name="validadeCertidao" type="date" value={formData.validadeCertidao} onChange={handleInputChange} className="w-1/2 p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500" />
+            </div>
+
+            <div className="flex items-center space-x-4">
+                <label className="text-sm font-medium text-gray-700">Status:</label>
+                <select name="status" value={formData.status} onChange={handleInputChange} required className="p-3 border rounded-lg focus:ring-blue-500 focus:border-blue-500 appearance-none flex-grow">
+                    <option value="Ativo">Ativo</option>
+                    <option value="Bloqueado">Bloqueado</option>
+                </select>
+            </div>
+
+            <div className="flex items-center space-x-4">
+                <label htmlFor="score" className="text-sm font-medium text-gray-700 flex-shrink-0">Score (0-100):</label>
+                <input name="performanceScore" id="score" type="range" min="0" max="100" step="1" value={formData.performanceScore} onChange={handleInputChange} className="flex-grow h-2 bg-blue-100 rounded-lg appearance-none cursor-pointer range-lg" />
+                <span className="text-lg font-bold text-blue-600 w-10 text-right">{formData.performanceScore}</span>
+            </div>
+
+            <div className="md:col-span-2 lg:col-span-3 flex justify-end space-x-4 mt-4">
+                {isEditing && (
+                    <button type="button" onClick={handleCancel} className="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-100 transition duration-150">
+                        Cancelar Edição
+                    </button>
+                )}
+                <button type="submit" className="px-6 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition duration-150">
+                    {isEditing ? 'Salvar Alterações' : 'Cadastrar Fornecedor'}
+                </button>
+            </div>
+          </form>
+        </div>
+
+        {/* Lista de Fornecedores */}
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+            <h3 className="text-xl font-semibold mb-4 text-gray-700">Fornecedores Cadastrados ({suppliers.length})</h3>
+            <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                    <thead>
+                        <tr className="text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
+                            <th className="px-6 py-3 text-left">Razão Social</th>
+                            <th className="px-6 py-3 text-left">CNPJ</th>
+                            <th className="px-6 py-3 text-left">Categoria</th>
+                            <th className="px-6 py-3 text-center">Score</th>
+                            <th className="px-6 py-3 text-center">Certidão</th>
+                            <th className="px-6 py-3 text-center">Status</th>
+                            <th className="px-6 py-3 text-right">Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                        {suppliers.map(supplier => {
+                            const validity = checkValidity(supplier.validadeCertidao);
+                            return (
+                                <tr key={supplier.id} className={supplier.status === 'Bloqueado' ? 'bg-red-50 hover:bg-red-100' : 'hover:bg-gray-50'}>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{supplier.razaoSocial}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{supplier.cnpj}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{supplier.categoria}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm font-bold text-center">{supplier.performanceScore}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-center">
+                                        <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${validity.color}`}>
+                                            {validity.status}
+                                        </span>
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-center">
+                                        <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${supplier.status === 'Ativo' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                                            {supplier.status}
+                                        </span>
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                        <button onClick={() => handleEdit(supplier)} className="text-blue-600 hover:text-blue-900 transition duration-150">
+                                            Editar
+                                        </button>
+                                    </td>
+                                </tr>
+                            );
+                        })}
+                    </tbody>
+                </table>
+            </div>
+            {suppliers.length === 0 && <p className="text-center text-gray-500 italic mt-4">Nenhum fornecedor cadastrado.</p>}
+        </div>
+      </div>
+    );
+  };
+
+  // --- Módulo: Pedidos (OC) & Sourcing & Recebimento ---
+  const ReceivingModule = () => {
+    const prsOC = requisitions.filter(r => r.status === PR_STATUSES.OC_ISSUED || r.status === PR_STATUSES.DELIVERED_PARCIAL || r.status === PR_STATUSES.DELIVERED_TOTAL);
+    const readyForSourcing = requisitions.filter(r => r.status === PR_STATUSES.APPROVED_FOR_SOURCING);
+    const [promptModal, setPromptModal] = useState(null); // Estado para o PromptModal
+
+    // Gerar OC/OS
+    const handleGenerateOC = async (pr) => {
+      showGlobalMessage(`Gerando OC para PR ${pr.id.substring(0, 8)}...`, 'loading');
+      const auditNote = `PR convertida em Ordem de Compra/Serviço.`;
+      const auditEntry = createAuditEntry('Gerar OC/OS', auditNote, appUserRole, AVAILABLE_ROLES.COMPRAS);
+
+      const result = await updateItem('requests', pr.id, {
+        status: PR_STATUSES.OC_ISSUED,
+        orderNumber: `OC-${pr.id.substring(0, 4)}-${Math.floor(Math.random() * 900) + 100}`,
+        issuedAt: serverTimestamp(),
+        supplierId: activeSuppliers.find(s => s.razaoSocial === pr.sugestaoFornecedor)?.id || 'N/A'
+      }, auditEntry);
+
+      if (result.success) {
+        showGlobalMessage(`OC emitida com sucesso para PR ${pr.id.substring(0, 8)}.`);
+      } else {
+        showGlobalMessage(`Erro ao emitir OC: ${result.error}`, 'error');
+      }
+    };
+
+    // Registrar Entrega
+    const handleRegisterDelivery = (pr) => {
+        const remaining = pr.quantidade - pr.quantitiesReceived;
+
+        setPromptModal({
+            title: `Registrar Entrega - PR ${pr.id.substring(0, 8)}`,
+            fields: [
+                { name: 'quantityDelivered', label: `Quantidade Entregue (Máx: ${remaining})`, type: 'number', required: true, min: 0.001, max: remaining, step: 'any' },
+                { name: 'receivedBy', label: 'Nome do Receptor (Setor)', type: 'text', required: true },
+                { name: 'deliveredBy', label: 'Nome do Entregador/Fornecedor', type: 'text', required: true },
+                { name: 'deliveryNote', label: 'Nota da Entrega', type: 'textarea', required: false },
+                { name: 'attachmentName', label: 'Comprovante (Nome do Arquivo)', type: 'text', required: false },
+            ],
+            onSubmit: (data) => {
+                executeDelivery(pr, data);
+                setPromptModal(null);
+            },
+            onCancel: () => setPromptModal(null),
+            submitLabel: 'Registrar'
+        });
+    };
+
+    const executeDelivery = async (pr, data) => {
+        const deliveredQty = parseFloat(data.quantityDelivered);
+        
+        // A validação de range já é feita no PromptModal, mas mantemos uma checagem de segurança
+        if (deliveredQty <= 0 || deliveredQty > (pr.quantidade - pr.quantitiesReceived + 0.0001)) { // pequena tolerância float
+            showGlobalMessage(`Quantidade inválida ou superior ao saldo pendente.`, 'error');
+            return;
+        }
+
+        const newQuantitiesReceived = pr.quantitiesReceived + deliveredQty;
+        let newStatus = PR_STATUSES.DELIVERED_PARCIAL;
+
+        // Tolerância de 0.0001 para comparação de floats
+        if (newQuantitiesReceived >= pr.quantidade - 0.0001) {
+            newStatus = PR_STATUSES.DELIVERED_TOTAL;
+        }
+
+        const deliveryRecord = {
+            ...data,
+            quantityDelivered: deliveredQty,
+            deliveredAt: new Date(), // CORRIGIDO: Usando new Date()
+            confirmedByRequester: false,
+            confirmedAt: null,
+        };
+
+        const auditNote = `Entrega de ${deliveredQty} ${pr.unidade}. Novo saldo: ${newQuantitiesReceived}/${pr.quantidade}. Status: ${newStatus.replace(/_/g, ' ')}.`;
+        const auditEntry = createAuditEntry('Registro Entrega', auditNote, appUserRole, 'Recebimento');
+
+        const result = await updateItem('requests', pr.id, {
+            status: newStatus,
+            quantitiesReceived: newQuantitiesReceived,
+            deliveries: arrayUnion(deliveryRecord)
+        }, auditEntry);
+
+        if (result.success) {
+            showGlobalMessage(`Entrega de ${deliveredQty} registrada com sucesso. Status atualizado para ${newStatus.replace(/_/g, ' ')}.`);
+        } else {
+            showGlobalMessage(`Erro ao registrar entrega: ${result.error}`, 'error');
+        }
+    };
+
+    const handleConfirmDelivery = async (pr, deliveryIndex) => {
+        const delivery = pr.deliveries[deliveryIndex];
+        if (delivery.confirmedByRequester) return;
+
+        const updatedDeliveries = [...pr.deliveries];
+        updatedDeliveries[deliveryIndex] = {
+            ...delivery,
+            confirmedByRequester: true,
+            confirmedAt: new Date(), // CORRIGIDO: Usando new Date()
+            confirmedBy: currentUserName,
+        };
+
+        const auditNote = `Entrega de ${delivery.quantityDelivered} confirmada pelo solicitante.`;
+        const auditEntry = createAuditEntry('Confirmação Entrega', auditNote, appUserRole, AVAILABLE_ROLES.SOLICITANTE);
+
+        const result = await updateItem('requests', pr.id, {
+            deliveries: updatedDeliveries
+        }, auditEntry);
+
+        if (result.success) {
+            showGlobalMessage('Entrega confirmada pelo solicitante.');
+        } else {
+            showGlobalMessage(`Erro ao confirmar entrega: ${result.error}`, 'error');
+        }
+    };
+
+    const OrderList = ({ requisitions, title, isOCList }) => (
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+            <h3 className="text-xl font-semibold mb-4 text-gray-700">{title} ({requisitions.length})</h3>
+            <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                    <thead>
+                        <tr className="text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
+                            <th className="px-6 py-3 text-left">ID</th>
+                            <th className="px-6 py-3 text-left">Item</th>
+                            <th className="px-6 py-3 text-left">Fornecedor</th>
+                            {isOCList && <th className="px-6 py-3 text-center">Qtde Recebida</th>}
+                            <th className="px-6 py-3 text-center">Status</th>
+                            <th className="px-6 py-3 text-right">Ação</th>
+                        </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                        {requisitions.map(pr => (
+                            <React.Fragment key={pr.id}>
+                                <tr className="hover:bg-gray-50">
+                                    <td className="px-6 py-4 whitespace-nowrap text-xs font-mono text-gray-900">{pr.id.substring(0, 8)}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{pr.produtoServico}</td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{pr.sugestaoFornecedor}</td>
+                                    {isOCList && <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700 text-center">{pr.quantitiesReceived} / {pr.quantidade}</td>}
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-center">
+                                        <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${getStatusColor(pr.status)}`}>
+                                            {pr.status.replace(/_/g, ' ')}
+                                        </span>
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
+                                        {!isOCList && appUserRole === AVAILABLE_ROLES.COMPRAS && (
+                                            <button onClick={() => handleGenerateOC(pr)} className="px-3 py-1 bg-indigo-600 text-white text-xs rounded-lg font-semibold hover:bg-indigo-700 transition duration-150">
+                                                Gerar OC/OS
+                                            </button>
+                                        )}
+                                        {isOCList && appUserRole === AVAILABLE_ROLES.COMPRAS && pr.status !== PR_STATUSES.DELIVERED_TOTAL && (pr.quantidade - pr.quantitiesReceived) > 0.0001 && (
+                                            <button onClick={() => handleRegisterDelivery(pr)} className="px-3 py-1 bg-green-600 text-white text-xs rounded-lg font-semibold hover:bg-green-700 transition duration-150">
+                                                Registrar Entrega
+                                            </button>
+                                        )}
+                                        {isOCList && pr.deliveries && pr.deliveries.length > 0 && (
+                                            <button onClick={(e) => { e.preventDefault(); pr.showDeliveries = !pr.showDeliveries; setRequisitions([...requisitions]); }} className="px-3 py-1 bg-gray-200 text-gray-700 text-xs rounded-lg font-semibold hover:bg-gray-300 transition duration-150">
+                                                {pr.showDeliveries ? 'Esconder Entregas' : 'Ver Entregas'}
+                                            </button>
+                                        )}
+                                    </td>
+                                </tr>
+                                {/* Histórico de Entregas */}
+                                {pr.showDeliveries && pr.deliveries.length > 0 && (
+                                    <tr>
+                                        <td colSpan={isOCList ? 6 : 5} className="p-4 bg-gray-50 border-t border-b">
+                                            <h4 className="text-sm font-bold mb-2">Histórico de Entregas:</h4>
+                                            <div className="overflow-x-auto">
+                                            <table className="min-w-full text-xs">
+                                                <thead>
+                                                    <tr className="text-gray-500 uppercase">
+                                                        <th className="py-2 text-left">Data</th>
+                                                        <th className="py-2 text-left">Entregador</th>
+                                                        <th className="py-2 text-left">Receptor</th>
+                                                        <th className="py-2 text-center">Qtde</th>
+                                                        <th className="py-2 text-center">Confirmação</th>
+                                                        <th className="py-2 text-right">Comprovante</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {pr.deliveries.map((d, idx) => (
+                                                        <tr key={idx} className="border-t">
+                                                            <td className="py-2">{formatDate(d.deliveredAt)}</td>
+                                                            <td className="py-2">{d.deliveredBy}</td>
+                                                            <td className="py-2">{d.receivedBy}</td>
+                                                            <td className="py-2 text-center font-bold">{d.quantityDelivered}</td>
+                                                            <td className="py-2 text-center">
+                                                                {d.confirmedByRequester ? (
+                                                                    <span className="text-green-600 font-semibold">Confirmado</span>
+                                                                ) : (
+                                                                    appUserRole === AVAILABLE_ROLES.SOLICITANTE && (
+                                                                        <button onClick={() => handleConfirmDelivery(pr, idx)} className="text-blue-600 hover:text-blue-900 underline text-xs">
+                                                                            Confirmar
+                                                                        </button>
+                                                                    )
+                                                                )}
+                                                            </td>
+                                                            <td className="py-2 text-right text-gray-500 italic">{d.attachmentName || 'N/A'}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                )}
+                            </React.Fragment>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            {requisitions.length === 0 && <p className="text-center text-gray-500 italic mt-4">Nenhuma requisição nesta lista.</p>}
+        </div>
+    );
+
+    return (
+      <div className="p-6 space-y-8 bg-gray-50 min-h-[calc(100vh-120px)]">
+        <h2 className="text-3xl font-bold text-gray-800 border-b pb-2">Módulo Pedidos (OC) & Recebimento</h2>
+
+        {/* PRs Aprovadas para Cotação / Sourcing */}
+        <OrderList
+            requisitions={readyForSourcing}
+            title="PRs Aprovadas para Cotação (Prontas para Sourcing)"
+            isOCList={false}
+        />
+
+        {/* Pedidos Emitidos / Em Recebimento */}
+        <OrderList
+            requisitions={prsOC}
+            title="Pedidos de Compra (OC) Emitidos e em Recebimento"
+            isOCList={true}
+        />
+
+        {/* Renderiza o Prompt Modal se estiver ativo */}
+        {promptModal && <PromptModal {...promptModal} />}
+      </div>
+    );
+  };
+
+  // --- Módulo: Dashboard (KPIs Analíticos) ---
+  const DashboardModule = () => {
+    // 1. Cálculos de Métricas
+    const totalRequisitions = requisitions.length;
+    const submittedCount = requisitions.filter(r => r.status !== PR_STATUSES.DRAFT).length;
+    const pendingApproval = requisitions.filter(r => r.status.startsWith('Aprovacao_') || r.status === PR_STATUSES.SUBMITTED).length;
+    const ocIssued = requisitions.filter(r => r.status === PR_STATUSES.OC_ISSUED || r.status.startsWith('Entregue_')).length;
+    const rejectedCount = requisitions.filter(r => r.status === PR_STATUSES.REJECTED).length;
+    const deliveredTotal = requisitions.filter(r => r.status === PR_STATUSES.DELIVERED_TOTAL).length;
+    const deliveredPartial = requisitions.filter(r => r.status === PR_STATUSES.DELIVERED_PARCIAL).length;
+    const rejectionRate = submittedCount > 0 ? ((rejectedCount / submittedCount) * 100).toFixed(1) : 0;
+
+    // 2. Distribuição de Status (Gráfico de Barra Empilhada/Pizza)
+    const statusCounts = requisitions.reduce((acc, r) => {
+      acc[r.status] = (acc[r.status] || 0) + 1;
+      return acc;
+    }, {});
+
+    const statusData = Object.keys(statusCounts).map(status => ({
+      status: status.replace(/_/g, ' '),
+      count: statusCounts[status]
+    })).sort((a, b) => b.count - a.count);
+
+    // 3. Top 5 Produtos/Serviços
+    const productCounts = requisitions.reduce((acc, r) => {
+      acc[r.produtoServico] = (acc[r.produtoServico] || 0) + r.quantidade;
+      return acc;
+    }, {});
+
+    const topProducts = Object.keys(productCounts)
+      .map(name => ({ name, totalQty: productCounts[name] }))
+      .sort((a, b) => b.totalQty - a.totalQty)
+      .slice(0, 5);
+
+    // 4. Ranking de Fornecedores por Performance Score
+    const rankedSuppliers = useMemo(() => {
+        return [...suppliers].sort((a, b) => b.performanceScore - a.performanceScore);
+    }, [suppliers]);
+
+    const Card = ({ title, value, unit = '', color = 'bg-blue-500' }) => (
+      <div className={`p-6 rounded-xl shadow-sm ${color} text-white`}>
+        <div className="text-sm font-light uppercase">{title}</div>
+        <div className="mt-1 text-4xl font-extrabold">
+          {value}
+          <span className="text-xl ml-1 font-semibold">{unit}</span>
+        </div>
+      </div>
+    );
+
+    const ChartContainer = ({ title, children }) => (
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+            <h3 className="text-lg font-semibold mb-4 text-gray-700">{title}</h3>
+            {children}
+        </div>
+    );
+
+    const StatusBar = ({ status, count, total }) => {
+        const percentage = total > 0 ? (count / total) * 100 : 0;
+        const color = getStatusColor(Object.keys(PR_STATUSES).find(key => PR_STATUSES[key] === status.replace(/ /g, '_'))) || 'bg-gray-400';
+
+        return (
+            <div className="mb-2">
+                <div className="flex justify-between text-sm text-gray-600">
+                    <span>{status}</span>
+                    <span>{count} ({percentage.toFixed(0)}%)</span>
+                </div>
+                <div className="h-2 bg-gray-200 rounded-full mt-1 overflow-hidden">
+                    <div className={`${color.replace('-100', '-500').replace('-200', '-600')} h-2 transition-all duration-500`} style={{ width: `${percentage}%` }}></div>
+                </div>
+            </div>
+        );
+    };
+
+    const BarChartItem = ({ name, value, totalMax }) => {
+        const percentage = totalMax > 0 ? (value / totalMax) * 100 : 0;
+        return (
+            <div className="flex items-center mb-3">
+                <div className="w-1/3 text-sm text-gray-600 truncate mr-2">{name}</div>
+                <div className="w-2/3 h-6 bg-blue-100 rounded-lg overflow-hidden relative">
+                    <div className="bg-blue-600 h-full absolute transition-all duration-500" style={{ width: `${percentage}%` }}></div>
+                    <span className="absolute right-2 top-0.5 text-xs font-bold text-white drop-shadow-sm">{value}</span>
+                </div>
+            </div>
+        );
+    };
+
+    return (
+      <div className="p-6 space-y-8 bg-gray-50 min-h-[calc(100vh-120px)]">
+        <h2 className="text-3xl font-bold text-gray-800 border-b pb-2">Dashboard Executivo</h2>
+        <p className="text-sm text-gray-500">Usuário Logado ({currentUserName}) | Total de Documentos: {totalRequisitions}</p>
+
+        {/* Cartões de Métricas */}
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-4 lg:gap-6">
+          {/* MODIFICAÇÃO: Cores mais planas e escuras */}
+          <Card title="Requisições Submetidas" value={submittedCount} color="bg-indigo-700" />
+          <Card title="Pendentes de Aprovação" value={pendingApproval} color="bg-amber-500" />
+          <Card title="OCs/OSs Emitidas" value={ocIssued} color="bg-cyan-700" />
+          <Card title="Rejeitadas" value={rejectedCount} color="bg-red-700" />
+          <Card title="Entregues Totalmente" value={deliveredTotal} color="bg-green-700" />
+          <Card title="Taxa de Rejeição" value={rejectionRate} unit="%" color="bg-gray-800" />
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            {/* Distribuição de Fluxo (Status) */}
+            <ChartContainer title="Distribuição de Status das Requisições">
+                {statusData.map(data => (
+                    <StatusBar key={data.status} status={data.status} count={data.count} total={totalRequisitions} />
+                ))}
+            </ChartContainer>
+
+            {/* Top 5 Produtos/Serviços */}
+            <ChartContainer title="Top 5 Itens Mais Solicitados (Quantia)">
+                {topProducts.map((item, index) => (
+                    <BarChartItem
+                        key={index}
+                        name={item.name}
+                        value={item.totalQty}
+                        totalMax={topProducts[0]?.totalQty || 1}
+                    />
+                ))}
+            </ChartContainer>
+        </div>
+
+        {/* Tabela de Ranking de Fornecedores */}
+        <ChartContainer title="Ranking de Fornecedores por Performance Score">
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead>
+                <tr className="text-xs font-medium text-gray-500 uppercase tracking-wider bg-gray-50">
+                  <th className="px-6 py-3 text-left">Ranking</th>
+                  <th className="px-6 py-3 text-left">Razão Social</th>
+                  <th className="px-6 py-3 text-left">CNPJ</th>
+                  <th className="px-6 py-3 text-center">Score (0-100)</th>
+                  <th className="px-6 py-3 text-center">Status</th>
+                  <th className="px-6 py-3 text-center">Certidão</th>
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {rankedSuppliers.map((supplier, index) => {
+                    const validity = checkValidity(supplier.validadeCertidao);
+                    return (
+                        <tr key={supplier.id} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{index + 1}º</td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{supplier.razaoSocial}</td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-700">{supplier.cnpj}</td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm font-bold text-center">{supplier.performanceScore}</td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-center">
+                                <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${supplier.status === 'Ativo' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>
+                                    {supplier.status}
+                                </span>
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-center">
+                                <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${validity.color}`}>
+                                    {validity.status}
+                                </span>
+                            </td>
+                        </tr>
+                    );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {suppliers.length === 0 && <p className="text-gray-500 italic mt-4">Nenhum fornecedor cadastrado para ranking.</p>}
+        </ChartContainer>
+      </div>
+    );
+  };
+
+
+  // --- Layout Principal (Header e Tabs) ---
+  const tabItems = [
+    { id: 'pr', label: 'Requisições (PR)' },
+    { id: 'pr_edit', label: 'Nova PR', hidden: true }, // Aba oculta para criação/edição
+    { id: 'srm', label: 'Fornecedores (SRM)' },
+    { id: 'oc', label: 'Pedidos/Recebimento' },
+    { id: 'dashboard', label: 'Dashboard (KPIs)' },
+  ];
+
+  const renderContent = () => {
+    switch (activeTab) {
+      case 'pr':
+        return <PRModule />;
+      case 'pr_edit':
+        return <PRModule />; // O PRModule gerencia o formulário de edição/criação
+      case 'srm':
+        return <SRMModule />;
+      case 'oc':
+        return <ReceivingModule />;
+      case 'dashboard':
+        return <DashboardModule />;
+      default:
+        return <PRModule />;
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-100 font-sans antialiased">
+        {/* Mensagem Global de Alerta/Sucesso */}
+        {globalMessage.text && (
+            <div className={`fixed top-4 right-4 z-50 p-4 rounded-lg shadow-lg text-sm font-semibold transition-opacity duration-300 ${
+                globalMessage.type === 'error' ? 'bg-red-500 text-white' : globalMessage.type === 'loading' ? 'bg-blue-500 text-white animate-pulse' : 'bg-green-500 text-white'
+            }`}>
+                {globalMessage.text}
+            </div>
+        )}
+
+        {/* MODIFICAÇÃO: shadow-md -> shadow-sm */}
+        <header className="bg-white shadow-sm sticky top-0 z-10">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+                <h1 className="text-2xl font-extrabold text-blue-800">Sistema de Compras Evereste</h1>
+                <div className="text-sm text-gray-600">
+                    <span className="font-semibold">{currentUserName}</span>
+                </div>
+            </div>
+            {/* Navegação por Abas */}
+            <nav className="bg-gray-50 border-t border-gray-200">
+                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex space-x-4">
+                    {tabItems.filter(item => !item.hidden).map(item => (
+                        <button
+                            key={item.id}
+                            onClick={() => setActiveTab(item.id)}
+                            className={`py-3 px-4 text-sm font-medium transition duration-150 ${
+                                activeTab === item.id || (activeTab === 'pr_edit' && item.id === 'pr')
+                                    ? 'border-b-4 border-blue-600 text-blue-600 bg-white'
+                                    : 'text-gray-600 hover:text-blue-500 hover:bg-gray-100'
+                            }`}
+                        >
+                            {item.label}
+                        </button>
+                    ))}
+                </div>
+            </nav>
+        </header>
+
+        <main className="max-w-7xl mx-auto sm:px-6 lg:px-8 py-8">
+            {renderContent()}
+        </main>
+    </div>
+  );
+};
+
+export default App;
