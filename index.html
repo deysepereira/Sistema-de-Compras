@@ -1,0 +1,67 @@
+rules_version = '2';// Definição global para as coleções públicas no caminho padrão do Canvasservice cloud.firestore {match /databases/{database}/documents {// Captura o ID do aplicativo que está isolando os dados (appId)match /artifacts/{appId}/public/data {  // Função de apoio para extrair o papel (role) do usuário a partir do token de autenticação
+  // NOTA: Em um ambiente de produção, você deve usar `request.auth.token.role`.
+  // Como estamos simulando a autenticação via __initial_auth_token,
+  // esta regra pressupõe que o usuário está autenticado anonimamente,
+  // e por simplicidade, faremos o acesso público para leitura, mas
+  // o sistema implementa a lógica de roles no lado do cliente.
+  // 
+  // PARA PRODUÇÃO REAL:
+  // function isSignedIn() {
+  //   return request.auth != null;
+  // }
+  // function getRole() {
+  //   return request.auth.token.role; // Exige que o token contenha o campo 'role'
+  // }
+  
+  // =================================================================
+  // 1. REGRAS PARA FORNECEDORES (suppliers) - Módulo SRM
+  // =================================================================
+  match /suppliers/{supplierId} {
+    // Leitura: Permitida para todos que acessam o sistema (usuários autenticados)
+    allow read: if request.auth != null;
+    
+    // Criação/Escrita/Atualização: Apenas para usuários com o papel 'Compras'
+    // Simulação de regra de negócio: Apenas Compras pode cadastrar/editar fornecedores.
+    // NOTE: No ambiente atual (Canvas), request.auth.token.role NÃO está disponível.
+    // Se esta regra fosse aplicada diretamente, todos os usuários autenticados teriam 
+    // a mesma permissão. A lógica de role é forçada no lado do cliente (App.jsx).
+    // 
+    // Em produção, usaria: allow write: if getRole() == 'Compras';
+    allow write: if request.auth != null; // Permissão total para usuários logados na simulação
+  }
+
+  // =================================================================
+  // 2. REGRAS PARA REQUISIÇÕES (requests) - Módulos PR, OC e Recebimento
+  // =================================================================
+  match /requests/{prId} {
+    // Leitura: Permitida para todos os usuários autenticados (visibilidade total do fluxo)
+    allow read: if request.auth != null;
+
+    // Criação: Permitida para todos os usuários autenticados (simulando Solicitante)
+    allow create: if request.auth != null; 
+    
+    // Atualização (write/update): Requer regras mais específicas baseadas no status
+    allow update: if request.auth != null && (
+
+      // 2.1. Permissão para Solicitante (para Rascunho e Rejeitada)
+      // Em produção: request.auth.token.role == 'Solicitante' && resource.data.createdBy == request.auth.uid &&
+      (resource.data.status == 'Rascunho' || resource.data.status == 'Rejeitada') 
+      
+      // 2.2. Permissão para Aprovação N1
+      // Em produção: || (request.auth.token.role == 'Aprovador N1' && resource.data.status == 'Aprovacao_N1_Pendente')
+      || (resource.data.status == 'Aprovacao_N1_Pendente')
+
+      // 2.3. Permissão para Aprovação N2
+      // Em produção: || (request.auth.token.role == 'Aprovador N2' && resource.data.status == 'Aprovacao_N2_Pendente')
+      || (resource.data.status == 'Aprovacao_N2_Pendente')
+
+      // 2.4. Permissão para Compras (Gerar OC, Registrar Recebimento)
+      // Em produção: || request.auth.token.role == 'Compras'
+      || (resource.data.status == 'Aprovada_para_Cotacao' || resource.data.status == 'OC_Emitida' || resource.data.status == 'Entregue_Parcial')
+    );
+    
+    // Exclusão: Ninguém pode excluir requisições no fluxo
+    allow delete: if false; 
+  }
+}
+}}
